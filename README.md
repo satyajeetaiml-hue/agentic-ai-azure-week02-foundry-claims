@@ -1,5 +1,7 @@
 # Week 2 — Microsoft Foundry & Foundry Agent Service
 
+[![CI](https://github.com/satyajeetaiml-hue/agentic-ai-azure-week02-foundry-claims/actions/workflows/ci.yml/badge.svg)](https://github.com/satyajeetaiml-hue/agentic-ai-azure-week02-foundry-claims/actions/workflows/ci.yml)
+
 > **Standalone lab** from the *Agentic AI on Azure — Enterprise Master Class* (12 weeks).
 > Each lab is an independent, runnable FastAPI starter. Part of the
 > [course series](https://github.com/satyajeetaiml-hue?tab=repositories&q=agentic-ai-azure).
