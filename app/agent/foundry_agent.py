@@ -1,17 +1,17 @@
-"""Foundry Agent Service backend.
+"""Foundry Agent Service backend — **persistent hosted agent**.
 
-Uses the current **azure-ai-projects v2** SDK: an ``AIProjectClient`` authenticated
-with Entra ID (``DefaultAzureCredential``), from which we obtain an OpenAI client via
-``get_openai_client()`` and drive the agent through the **Responses API** with a custom
-``policy_lookup`` *function tool*.
+Uses the current **azure-ai-projects v2** SDK to create a *hosted* agent that is
+registered in your Foundry project (visible in the portal) and reused across
+requests, then runs it via the Responses API with an ``agent_reference``:
 
-The flow mirrors the agent loop:
-  reason/plan  -> model decides to call the tool
-  act          -> we execute ``policy_lookup`` locally and feed the result back
-  observe      -> model returns the final structured JSON, which we validate.
+  * ``project.agents.create_version(agent_name, definition=PromptAgentDefinition(
+        model, instructions, tools=[FunctionTool(...)]))`` — the hosted agent.
+  * ``openai_client.responses.create(input=..., extra_body={"agent_reference": ...})``
+    — runs the hosted agent; tool calls surface as ``function_call`` output items
+    which we execute (``policy_lookup``) and feed back as ``function_call_output``.
 
-Azure SDK imports are done lazily so the rest of the app (and the mock backend)
-runs without the Azure packages installed.
+The flow still mirrors the agent loop (reason → plan → act → observe). Azure SDK
+imports are lazy so the mock backend and tests run without the Azure packages.
 """
 
 import json
@@ -29,6 +29,8 @@ from app.schemas import (
 from app.tools.policy_lookup import POLICY_TOOL_SCHEMA, policy_lookup
 
 _MAX_TOOL_ITERATIONS = 5
+# Process-level cache so the hosted agent is created once and reused across requests.
+_AGENT_VERSIONS: dict[str, str] = {}
 
 
 class FoundryClaimsAgent:
@@ -45,55 +47,73 @@ class FoundryClaimsAgent:
                 "Install requirements.txt, or unset FOUNDRY_PROJECT_ENDPOINT to use mock mode."
             ) from exc
 
-        steps: list[str] = []
+        s = self.settings
         with (
             DefaultAzureCredential() as credential,
-            AIProjectClient(
-                endpoint=self.settings.foundry_project_endpoint, credential=credential
-            ) as project,
+            AIProjectClient(endpoint=s.foundry_project_endpoint, credential=credential) as project,
+            project.get_openai_client() as openai_client,
         ):
-            steps.append("Connected to Foundry project; using Responses API agent runtime.")
-            openai_client = project.get_openai_client()
-
-            response = openai_client.responses.create(
-                model=self.settings.foundry_model_name,
-                input=[
-                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                    {"role": "user", "content": self._user_prompt(request)},
-                ],
-                tools=[POLICY_TOOL_SCHEMA],
-            )
-
-            # Drive the function-tool calling loop until the model stops requesting tools.
-            for _ in range(_MAX_TOOL_ITERATIONS):
-                calls = [it for it in response.output if getattr(it, "type", None) == "function_call"]
-                if not calls:
-                    break
-                tool_outputs = []
-                for call in calls:
-                    args = json.loads(call.arguments or "{}")
-                    if call.name == "policy_lookup":
-                        result = policy_lookup(args.get("policy_number", ""))
-                        steps.append(f"Model invoked policy_lookup -> status={result.get('status')}.")
-                    else:
-                        result = {"error": f"unknown tool '{call.name}'"}
-                    tool_outputs.append(
-                        {
-                            "type": "function_call_output",
-                            "call_id": call.call_id,
-                            "output": json.dumps(result),
-                        }
-                    )
-                response = openai_client.responses.create(
-                    model=self.settings.foundry_model_name,
-                    previous_response_id=response.id,
-                    input=tool_outputs,
-                    tools=[POLICY_TOOL_SCHEMA],
-                )
-
-            final_text = response.output_text or "{}"
+            agent_name = self._ensure_agent(project)
+            final_text, steps = self._run(openai_client, agent_name, request)
 
         return self._build_response(request, final_text, steps)
+
+    def _ensure_agent(self, project) -> str:
+        """Create the hosted agent once (cached), returning its name to reference."""
+        from azure.ai.projects.models import FunctionTool, PromptAgentDefinition
+
+        name = self.settings.foundry_agent_name
+        if name in _AGENT_VERSIONS:
+            return name
+
+        tool = FunctionTool(
+            name="policy_lookup",
+            description=POLICY_TOOL_SCHEMA["description"],
+            parameters=POLICY_TOOL_SCHEMA["parameters"],
+            strict=True,
+        )
+        agent = project.agents.create_version(
+            agent_name=name,
+            definition=PromptAgentDefinition(
+                model=self.settings.foundry_model_name,
+                instructions=SYSTEM_INSTRUCTIONS,
+                tools=[tool],
+            ),
+        )
+        _AGENT_VERSIONS[name] = agent.version
+        return name
+
+    def _run(self, openai_client, agent_name: str, request: ClaimIntakeRequest):
+        """Drive the hosted agent + function-tool loop; return (final_text, steps)."""
+        steps = [f"Using hosted Foundry agent '{agent_name}'."]
+        ref = {"agent_reference": {"name": agent_name, "type": "agent_reference"}}
+
+        response = openai_client.responses.create(input=self._user_prompt(request), extra_body=ref)
+
+        for _ in range(_MAX_TOOL_ITERATIONS):
+            calls = [it for it in response.output if getattr(it, "type", None) == "function_call"]
+            if not calls:
+                break
+            tool_outputs = []
+            for call in calls:
+                args = json.loads(call.arguments or "{}")
+                if call.name == "policy_lookup":
+                    result = policy_lookup(args.get("policy_number", ""))
+                    steps.append(f"Agent called policy_lookup -> status={result.get('status')}.")
+                else:
+                    result = {"error": f"unknown tool '{call.name}'"}
+                tool_outputs.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call.call_id,
+                        "output": json.dumps(result),
+                    }
+                )
+            response = openai_client.responses.create(
+                input=tool_outputs, previous_response_id=response.id, extra_body=ref
+            )
+
+        return (response.output_text or "{}"), steps
 
     @staticmethod
     def _user_prompt(request: ClaimIntakeRequest) -> str:
@@ -125,7 +145,7 @@ class FoundryClaimsAgent:
         return ClaimIntakeResponse(
             case_id=f"CASE-{uuid.uuid4().hex[:8].upper()}",
             decision=decision,
-            summary=data.get("summary") or "Claim processed by the Foundry agent.",
+            summary=data.get("summary") or "Claim processed by the Foundry hosted agent.",
             extracted=extracted,
             policy=policy,
             mode="foundry",

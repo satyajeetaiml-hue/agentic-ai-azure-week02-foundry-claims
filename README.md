@@ -22,9 +22,10 @@ A customer submits a free-text claim. The agent:
 ## ✅ What this repo implements
 Unlike the other week starters (which ship a single mock stub), **this lab is built out**:
 
-- A real **Foundry Agent Service backend** using the current **`azure-ai-projects` v2** SDK
-  (agents run on the **Responses API**), with a custom **function tool** (`policy_lookup`) that the
-  model calls during the run.
+- A real **Foundry Agent Service backend** that creates a **persistent hosted agent** with the current
+  **`azure-ai-projects` v2** SDK (`agents.create_version` + `PromptAgentDefinition`) — it's registered in
+  your Foundry project (visible in the portal), reused across requests, and runs via the Responses API
+  with an `agent_reference`, calling a custom **function tool** (`policy_lookup`) during the run.
 - A deterministic **mock backend** that mirrors the same extract → tool-call → decide flow, so the
   service is **runnable and fully testable with zero Azure resources**.
 - Typed **Pydantic contracts** as the trust boundary, and a clean `ClaimsAgent` interface that swaps
@@ -126,14 +127,20 @@ FOUNDRY_MODEL_NAME=gpt-4o          # your deployment name
 ```bash
 uvicorn app.main:app --reload
 ```
-`GET /health` will now report `"backend": "foundry"`, and `POST /api/v1/claims/intake` runs the model on
-Foundry, letting it call the `policy_lookup` tool during the run.
+On first request the backend **creates a hosted agent** named by `FOUNDRY_AGENT_NAME` (default
+`claims-intake-agent`) via `project.agents.create_version(...)` — it appears in your Foundry project's
+**Agents** list — then reuses it for subsequent requests. `GET /health` reports `"backend": "foundry"`,
+and `POST /api/v1/claims/intake` runs the hosted agent, which calls `policy_lookup` during the run.
 
-> **Note on the SDK:** Foundry's agent runtime is now built on the **OpenAI Responses protocol**
-> (`azure-ai-projects` v2). This repo obtains the client via `AIProjectClient.get_openai_client()` and
-> drives a tool-calling loop in [`app/agent/foundry_agent.py`](app/agent/foundry_agent.py). If you are on
-> an older 1.x SDK that uses `agents.create_agent` + threads/runs, see the
-> [migration notes](https://learn.microsoft.com/python/api/overview/azure/ai-projects-readme).
+> **How it's wired (`app/agent/foundry_agent.py`):** the hosted agent is defined with
+> `PromptAgentDefinition(model, instructions, tools=[FunctionTool(...)])` and created via
+> `agents.create_version`. Each request runs it with
+> `openai_client.responses.create(input=..., extra_body={"agent_reference": {"name": ..., "type":
+> "agent_reference"}})`; `function_call` items are executed locally and fed back as
+> `function_call_output`. This is the verified **azure-ai-projects v2** Agent Service API (the older 1.x
+> `create_agent` + threads/runs flow is deprecated).
+>
+> In production, create the agent once via IaC/CI and reference it by name (don't create per process).
 
 ---
 
@@ -141,9 +148,9 @@ Foundry, letting it call the `policy_lookup` tool during the run.
 1. ✅ Wrap a Foundry agent behind a FastAPI `/claims/intake` endpoint *(done — use as your reference)*.
 2. ✅ Add a `policy-lookup` tool the agent calls during the run *(done — `app/tools/policy_lookup.py`)*.
 3. ✅ Secure the connection with Managed Identity / `DefaultAzureCredential` *(done)*.
-4. 🔲 Replace the in-memory policy DB with a real call to your policy API (via APIM + Managed Identity).
-5. 🔲 Create the agent as a **persistent hosted agent** (so it appears in the Foundry portal) and reuse it
-   across requests instead of per-call.
+4. ✅ Create the agent as a **persistent hosted agent** (appears in the Foundry portal) and reuse it across
+   requests *(done — `_ensure_agent` in `app/agent/foundry_agent.py`)*.
+5. 🔲 Replace the in-memory policy DB with a real call to your policy API (via APIM + Managed Identity).
 6. 🔲 Add a second tool (e.g. `coverage_check`) and a guardrail for low-confidence extractions.
 
 ## 🏗️ Architect's lens
